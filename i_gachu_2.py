@@ -1,56 +1,56 @@
 import os
+import time
+import json
+import pandas as pd
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-import time, json
-from datetime import datetime, timedelta, timezone
 from pocketoptionapi.stable_api import PocketOption
 import pocketoptionapi.global_value as global_value
-import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
+
+###RESIPOTORY 6 HOUR LIMIT, avoid ob and os, with trend###
+
+# Load environment variables
 load_dotenv()
+
 # Session configuration
 start_counter = time.perf_counter()
 
-# Demo SSID Setup
 ssid = os.getenv("""SSID""")
 demo = True
 
-min_payout = 80
-period = 60  
-expiration = 60
+# Bot Settings
+min_payout = 90
+period = 300  
+expiration = 300
 INITIAL_AMOUNT = 1
-MARTINGALE_LEVEL = 4
-MIN_ACTIVE_PAIRS = 5
+MARTINGALE_LEVEL = 3
+MIN_ACTIVE_PAIRS = 20
+PROB_THRESHOLD = 0.76
+TAKE_PROFIT = 20  # <-- Take profit target in dollars
+current_profit = 0  # <-- Current cumulative profit
 
-WATCHLIST = [
-    "GBPAUD_otc", "GBPJPY_otc", "GBPUSD_otc",
-    "AUDUSD_otc", "AUDCAD_otc", "CADCHF_otc",
-    "USDCHF_otc", "USDJPY_otc", "USDCAD_otc",
-]
-
-
+# Connect to Pocket Option
 api = PocketOption(ssid, demo)
 api.connect()
 
 FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change']
-PROB_THRESHOLD = 0.76
 
+# Utility Functions
 def get_payout():
     try:
         d = json.loads(global_value.PayoutData)
         for pair in d:
-            name = pair[1]
-            payout = pair[5]
             if (
-                name in WATCHLIST and
+                len(pair) == 19 and
                 pair[14] == True and
-                name.endswith("_otc") and
-                len(name) == 10
+                pair[5] >= min_payout and
+                pair[1].endswith("_otc") and
+                len(pair[1]) == 10
             ):
-                if payout >= min_payout:
-                    global_value.pairs[name] = {'payout': payout, 'type': pair[3]}
-                elif name in global_value.pairs:
-                    del global_value.pairs[name]
+                p = {'payout': pair[5], 'type': pair[3]}
+                global_value.pairs[pair[1]] = p
         return True
     except:
         return False
@@ -69,9 +69,7 @@ def make_df(df0, history):
     df1 = pd.DataFrame(history).sort_values(by='time').reset_index(drop=True)
     df1['time'] = pd.to_datetime(df1['time'], unit='s', utc=True)
     df1.set_index('time', inplace=True)
-
     df = df1['price'].resample(f'{period}s').ohlc().reset_index()
-
     if df0 is not None:
         ts = datetime.timestamp(df.loc[0]['time'])
         for x in range(len(df0)):
@@ -131,13 +129,22 @@ def train_and_predict(df):
     call_conf = proba[0][1]
     put_conf = 1 - call_conf
 
-    if call_conf > PROB_THRESHOLD:
-        decision = "call"
-    elif put_conf > PROB_THRESHOLD:
-        decision = "put"
+    latest_close = df.iloc[-1]['close']
+    latest_ema26 = df['close'].ewm(span=26).mean().iloc[-1]
 
+    if call_conf > PROB_THRESHOLD and latest_close > latest_ema26:
+        decision = "call"
+        emoji = "🟢"
+        confidence = call_conf
+    elif put_conf > PROB_THRESHOLD and latest_close < latest_ema26:
+        decision = "put"
+        emoji = "🔴"
+        confidence = put_conf
     else:
+        global_value.logger("⏭️ Skipping trade due to low confidence or trend mismatch.", "INFO")
         return None
+
+    global_value.logger(f"{emoji} === PREDICTED: {decision.upper()} | CONFIDENCE: {confidence:.2%}", "INFO")
     return decision
 
 def perform_trade(amount, pair, action, expiration):
@@ -147,6 +154,8 @@ def perform_trade(amount, pair, action, expiration):
     return api.check_win(trade_id)
 
 def martingale_strategy(pair, action):
+    global current_profit
+
     amount = INITIAL_AMOUNT
     level = 1
     result = perform_trade(amount, pair, action, expiration)
@@ -154,15 +163,39 @@ def martingale_strategy(pair, action):
     if result is None:
         return
 
+    if result[1] == 'win':
+        current_profit += amount * (global_value.pairs[pair]['payout'] / 100)
+        global_value.logger(f"✅ WIN - Profit: {current_profit:.2f} USD", "INFO")
+    else:
+        current_profit -= amount
+        global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
+
     while result[1] == 'loose' and level < MARTINGALE_LEVEL:
         level += 1
         amount *= 2
         result = perform_trade(amount, pair, action, expiration)
 
+        if result is None:
+            return
+
+        if result[1] == 'win':
+            current_profit += amount * (global_value.pairs[pair]['payout'] / 100)
+            global_value.logger(f"✅ WIN - Profit: {current_profit:.2f} USD", "INFO")
+            break
+        else:
+            current_profit -= amount
+            global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
+
+    # ✅ Check Take Profit
+    if current_profit >= TAKE_PROFIT:
+        global_value.logger(f"🎯 Take Profit Achieved! Cooling down for 1 hour... Final Profit: {current_profit:.2f} USD", "INFO")
+        time.sleep(3600)  # Sleep for 1 hour
+        current_profit = 0  # Reset profit tracker after cooldown
+
     if result[1] != 'loose':
-        global_value.logger("✅ WIN - Resetting to base amount.", "INFO")
+        global_value.logger("WIN - Resetting to base amount.", "INFO")
     else:
-        global_value.logger("❌ LOSS. Resetting.", "INFO")
+        global_value.logger("LOSS. Resetting.", "INFO")
 
 def wait_until_next_candle(period_seconds=300, seconds_before=15):
     while True:
@@ -179,7 +212,11 @@ def wait_for_candle_start():
             break
         time.sleep(0.1)
 
-# PATCHED STRATEGIE FUNCTION
+# ✅ New timeout check function
+def near_github_timeout():
+    return (time.perf_counter() - start_counter) >= (6 * 3600 - 20 * 60)
+
+# Strategy loop
 def strategie():
     pairs_snapshot = list(global_value.pairs.keys())
 
@@ -215,8 +252,17 @@ def strategie():
             continue
 
         decision = train_and_predict(processed_df)
-
+       
+        
         if decision:
+            latest_rsi = processed_df.iloc[-1]['RSI']
+            if (decision == "call" and latest_rsi > 70) or (decision == "put" and latest_rsi < 30):
+                global_value.logger(f"Skipping {decision.upper()} due to RSI filter: RSI = {latest_rsi:.2f}", "INFO")
+                continue
+
+            if near_github_timeout():
+                global_value.logger("🕒 Near GitHub timeout. Skipping new trade to avoid interruption.", "INFO")
+                return
             wait_for_candle_start()
             martingale_strategy(pair, decision)
 
@@ -238,6 +284,7 @@ def start():
         while True:
             strategie()
 
+# Main entry
 if __name__ == "__main__":
     start()
     end_counter = time.perf_counter()
