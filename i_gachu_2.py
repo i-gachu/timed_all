@@ -8,9 +8,6 @@ from pocketoptionapi.stable_api import PocketOption
 import pocketoptionapi.global_value as global_value
 from sklearn.ensemble import RandomForestClassifier
 
-
-###RESIPOTORY 6 HOUR LIMIT, avoid ob and os, with trend###
-
 # Load environment variables
 load_dotenv()
 
@@ -21,15 +18,21 @@ ssid = os.getenv("""SSID""")
 demo = True
 
 # Bot Settings
-min_payout = 90
-period = 300  
-expiration = 300
+min_payout = 80
+period = 600  
+expiration = 600
 INITIAL_AMOUNT = 1
 MARTINGALE_LEVEL = 3
-MIN_ACTIVE_PAIRS = 20
+MIN_ACTIVE_PAIRS = 5
 PROB_THRESHOLD = 0.76
-TAKE_PROFIT = 20  # <-- Take profit target in dollars
-current_profit = 0  # <-- Current cumulative profit
+TAKE_PROFIT = 20  
+current_profit = 0  
+
+WATCHLIST = [
+    "GBPAUD_otc", "GBPJPY_otc", "GBPUSD_otc",
+    "AUDUSD_otc", "AUDCAD_otc", "CADCHF_otc",
+    "USDCHF_otc", "USDJPY_otc", "USDCAD_otc",
+]
 
 # Connect to Pocket Option
 api = PocketOption(ssid, demo)
@@ -42,15 +45,18 @@ def get_payout():
     try:
         d = json.loads(global_value.PayoutData)
         for pair in d:
+            name = pair[1]
+            payout = pair[5]
             if (
-                len(pair) == 19 and
-                pair[14] == True and
-                pair[5] >= min_payout and
-                pair[1].endswith("_otc") and
-                len(pair[1]) == 10
+                name in WATCHLIST and
+                pair[14] and
+                name.endswith("_otc") and
+                len(name) == 10
             ):
-                p = {'payout': pair[5], 'type': pair[3]}
-                global_value.pairs[pair[1]] = p
+                if payout >= min_payout:
+                    global_value.pairs[name] = {'payout': payout, 'type': pair[3]}
+                elif name in global_value.pairs:
+                    del global_value.pairs[name]
         return True
     except:
         return False
@@ -130,8 +136,9 @@ def train_and_predict(df):
     put_conf = 1 - call_conf
 
     latest_close = df.iloc[-1]['close']
-    latest_ema26 = df['close'].ewm(span=26).mean().iloc[-1]
-
+    latest_ema26 = df['close'].ewm(span=12).mean().iloc[-1]
+    latest_rsi = processed_df.iloc[-1]['RSI']
+    
     if call_conf > PROB_THRESHOLD and latest_close > latest_ema26:
         decision = "call"
         emoji = "🟢"
@@ -141,10 +148,9 @@ def train_and_predict(df):
         emoji = "🔴"
         confidence = put_conf
     else:
-        global_value.logger("⏭️ Skipping trade due to low confidence or trend mismatch.", "INFO")
         return None
 
-    global_value.logger(f"{emoji} === PREDICTED: {decision.upper()} | CONFIDENCE: {confidence:.2%}", "INFO")
+    global_value.logger(f"{emoji} === PREDICTED: {decision.upper()} | CONFIDENCE: {confidence:.2%} | RSI: {latest_rsi:.2f}", "INFO")
     return decision
 
 def perform_trade(amount, pair, action, expiration):
@@ -214,7 +220,7 @@ def wait_for_candle_start():
 
 # ✅ New timeout check function
 def near_github_timeout():
-    return (time.perf_counter() - start_counter) >= (6 * 3600 - 20 * 60)
+    return (time.perf_counter() - start_counter) >= (6 * 3600 - 1 * 60)
 
 # Strategy loop
 def strategie():
