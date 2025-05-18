@@ -8,6 +8,9 @@ from pocketoptionapi.stable_api import PocketOption
 import pocketoptionapi.global_value as global_value
 from sklearn.ensemble import RandomForestClassifier
 
+
+###RESIPOTORY 6 HOUR LIMIT, avoid ob and os, with trend###
+
 # Load environment variables
 load_dotenv()
 
@@ -25,8 +28,8 @@ INITIAL_AMOUNT = 1
 MARTINGALE_LEVEL = 3
 MIN_ACTIVE_PAIRS = 5
 PROB_THRESHOLD = 0.76
-TAKE_PROFIT = 20  
-current_profit = 0  
+TAKE_PROFIT = 20  # <-- Take profit target in dollars
+current_profit = 0  # <-- Current cumulative profit
 
 WATCHLIST = [
     "GBPAUD_otc", "GBPJPY_otc", "GBPUSD_otc",
@@ -38,7 +41,7 @@ WATCHLIST = [
 api = PocketOption(ssid, demo)
 api.connect()
 
-FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change']
+FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change', 'EMA_26']
 
 # Utility Functions
 def get_payout():
@@ -117,6 +120,7 @@ def prepare_data(df):
     df['MACD'] = ema_12 - ema_26
     df['MACD_EMA'] = df['MACD'].ewm(span=macd_signal).mean()
 
+    df['EMA_26'] = ema_26
     df['Price_Rate_Of_Change'] = df['close'].pct_change(periods=roc_period)
     df['Prediction'] = (df['close'].shift(-1) > df['close']).astype(int)
 
@@ -135,22 +139,21 @@ def train_and_predict(df):
     call_conf = proba[0][1]
     put_conf = 1 - call_conf
 
-    latest_close = df.iloc[-1]['close']
-    latest_ema26 = df['close'].ewm(span=12).mean().iloc[-1]
-    
-    if call_conf > PROB_THRESHOLD and latest_close > latest_ema26:
+    if call_conf > PROB_THRESHOLD:
         decision = "call"
         emoji = "🟢"
         confidence = call_conf
-    elif put_conf > PROB_THRESHOLD and latest_close < latest_ema26:
+    elif put_conf > PROB_THRESHOLD:
         decision = "put"
         emoji = "🔴"
         confidence = put_conf
     else:
+        global_value.logger("⏭️ Skipping trade due to low confidence.", "INFO")
         return None
 
     global_value.logger(f"{emoji} === PREDICTED: {decision.upper()} | CONFIDENCE: {confidence:.2%}", "INFO")
     return decision
+
 
 def perform_trade(amount, pair, action, expiration):
     result = api.buy(amount=amount, active=pair, action=action, expirations=expiration)
@@ -170,10 +173,8 @@ def martingale_strategy(pair, action):
 
     if result[1] == 'win':
         current_profit += amount * (global_value.pairs[pair]['payout'] / 100)
-        global_value.logger(f"✅ WIN - Profit: {current_profit:.2f} USD", "INFO")
     else:
         current_profit -= amount
-        global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
 
     while result[1] == 'loose' and level < MARTINGALE_LEVEL:
         level += 1
@@ -191,7 +192,6 @@ def martingale_strategy(pair, action):
             current_profit -= amount
             global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
 
-    # ✅ Check Take Profit
     if current_profit >= TAKE_PROFIT:
         global_value.logger(f"🎯 Take Profit Achieved! Cooling down for 1 hour... Final Profit: {current_profit:.2f} USD", "INFO")
         time.sleep(3600)  # Sleep for 1 hour
@@ -217,9 +217,8 @@ def wait_for_candle_start():
             break
         time.sleep(0.1)
 
-# ✅ New timeout check function
 def near_github_timeout():
-    return (time.perf_counter() - start_counter) >= (6 * 3600 - 1 * 60)
+    return (time.perf_counter() - start_counter) >= (6 * 3600 - 20 * 60)
 
 # Strategy loop
 def strategie():
@@ -271,6 +270,7 @@ def strategie():
             wait_for_candle_start()
             martingale_strategy(pair, decision)
 
+            wait_until_next_candle(period, 60)
             get_payout()
             get_df()
 
