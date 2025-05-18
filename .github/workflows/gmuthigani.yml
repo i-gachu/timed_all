@@ -1,4 +1,4 @@
-name: oSoBallpairs_5mins
+name: gmuthigani
 
 on:
   workflow_dispatch:    # Manual run
