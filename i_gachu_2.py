@@ -22,8 +22,8 @@ demo = True
 
 # Bot Settings
 min_payout = 80
-period = 600  
-expiration = 600
+period = 300  
+expiration = 300
 INITIAL_AMOUNT = 1
 MARTINGALE_LEVEL = 3
 MIN_ACTIVE_PAIRS = 5
@@ -41,7 +41,7 @@ WATCHLIST = [
 api = PocketOption(ssid, demo)
 api.connect()
 
-FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change', 'EMA_26']
+FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change']
 
 # Utility Functions
 def get_payout():
@@ -120,7 +120,6 @@ def prepare_data(df):
     df['MACD'] = ema_12 - ema_26
     df['MACD_EMA'] = df['MACD'].ewm(span=macd_signal).mean()
 
-    df['EMA_26'] = ema_26
     df['Price_Rate_Of_Change'] = df['close'].pct_change(periods=roc_period)
     df['Prediction'] = (df['close'].shift(-1) > df['close']).astype(int)
 
@@ -139,7 +138,10 @@ def train_and_predict(df):
     call_conf = proba[0][1]
     put_conf = 1 - call_conf
 
-    if call_conf > PROB_THRESHOLD:
+    latest_close = df.iloc[-1]['close']
+    latest_ema26 = df['close'].ewm(span=26).mean().iloc[-1]
+
+    if call_conf > PROB_THRESHOLD: 
         decision = "call"
         emoji = "🟢"
         confidence = call_conf
@@ -148,12 +150,11 @@ def train_and_predict(df):
         emoji = "🔴"
         confidence = put_conf
     else:
-        global_value.logger("⏭️ Skipping trade due to low confidence.", "INFO")
+        global_value.logger("⏭️ Skipping trade due to low confidence", "INFO")
         return None
 
     global_value.logger(f"{emoji} === PREDICTED: {decision.upper()} | CONFIDENCE: {confidence:.2%}", "INFO")
     return decision
-
 
 def perform_trade(amount, pair, action, expiration):
     result = api.buy(amount=amount, active=pair, action=action, expirations=expiration)
@@ -192,6 +193,7 @@ def martingale_strategy(pair, action):
             current_profit -= amount
             global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
 
+    # ✅ Check Take Profit
     if current_profit >= TAKE_PROFIT:
         global_value.logger(f"🎯 Take Profit Achieved! Cooling down for 1 hour... Final Profit: {current_profit:.2f} USD", "INFO")
         time.sleep(3600)  # Sleep for 1 hour
@@ -217,8 +219,9 @@ def wait_for_candle_start():
             break
         time.sleep(0.1)
 
+# ✅ New timeout check function
 def near_github_timeout():
-    return (time.perf_counter() - start_counter) >= (6 * 3600 - 20 * 60)
+    return (time.perf_counter() - start_counter) >= (6 * 3600 - 14 * 60)
 
 # Strategy loop
 def strategie():
@@ -259,10 +262,11 @@ def strategie():
        
         
         if decision:
-            latest_rsi = processed_df.iloc[-1]['RSI']
-            if (decision == "call" and latest_rsi > 70) or (decision == "put" and latest_rsi < 30):
-                global_value.logger(f"Skipping {decision.upper()} due to RSI filter: RSI = {latest_rsi:.2f}", "INFO")
+            latest_k = processed_df.iloc[-1]['k_percent']
+            if (decision == "call" and latest_k > 80) or (decision == "put" and latest_k < 20):
+                global_value.logger(f"Skipping {decision.upper()} due to %K Stochastic filter: %K = {latest_k:.2f}", "INFO")
                 continue
+
 
             if near_github_timeout():
                 global_value.logger("🕒 Near GitHub timeout. Skipping new trade to avoid interruption.", "INFO")
