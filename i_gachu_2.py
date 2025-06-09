@@ -263,7 +263,7 @@ def strategie():
         
         if decision:
             latest_k = processed_df.iloc[-1]['k_percent']
-            if (decision == "call" and latest_k > 80) or (decision == "put" and latest_k < 20):
+            if (decision == "call" and latest_k > 90) or (decision == "put" and latest_k < 10):
                 global_value.logger(f"Skipping {decision.upper()} due to %K Stochastic filter: %K = {latest_k:.2f}", "INFO")
                 continue
 
