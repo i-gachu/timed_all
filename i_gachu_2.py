@@ -7,93 +7,156 @@ from dotenv import load_dotenv
 from pocketoptionapi.stable_api import PocketOption
 import pocketoptionapi.global_value as global_value
 from sklearn.ensemble import RandomForestClassifier
-
-
-###RESIPOTORY 6 HOUR LIMIT, avoid ob and os, with trend###
+from oandapyV20.endpoints.instruments import InstrumentsCandles
+import oandapyV20
 
 # Load environment variables
 load_dotenv()
 
-# Session configuration
+# Session config
 start_counter = time.perf_counter()
 
-ssid = os.getenv("""SSID""")
+ssid = os.getenv("SSID")
 demo = True
 
 # Bot Settings
-min_payout = 80
-period = 300  
-expiration = 300
+period = 60
+expiration = 60
 INITIAL_AMOUNT = 1
-MARTINGALE_LEVEL = 3
-MIN_ACTIVE_PAIRS = 5
-PROB_THRESHOLD = 0.76
-TAKE_PROFIT = 20  # <-- Take profit target in dollars
-current_profit = 0  # <-- Current cumulative profit
+PROB_THRESHOLD = 0.60
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 
-WATCHLIST = [
-    "GBPAUD_otc", "GBPJPY_otc", "GBPUSD_otc",
-    "AUDUSD_otc", "AUDCAD_otc", "CADCHF_otc",
-    "USDCHF_otc", "USDJPY_otc", "USDCAD_otc",
-]
+# Trading instrument
+instrument = "USD_CAD"  # This will be updated dynamically
+currency_pair = "USDCAD"  # This will be updated dynamically
+max_candles = 5000
 
-# Connect to Pocket Option
+# OANDA setup
+client = oandapyV20.API(access_token=ACCESS_TOKEN)
+granularity = "M1"
+params = {
+    "granularity": granularity,
+    "count": 100,
+    "price": "M"
+}
+
+# Pocket Option setup
 api = PocketOption(ssid, demo)
 api.connect()
 
 FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change']
+model = None  # Global model object
 
-# Utility Functions
+def wait_until_next_candle(period_seconds=60, seconds_before=5):
+    while True:
+        now = datetime.now(timezone.utc)
+        now_seconds = now.hour * 3600 + now.minute * 60 + now.second
+        next_candle = ((now_seconds // period_seconds) + 1) * period_seconds
+        if now_seconds >= next_candle - seconds_before:
+            break
+        time.sleep(0.2)
+
+def wait_for_candle_start(period_seconds=60):
+    while True:
+        now = datetime.now(timezone.utc)
+        now_seconds = now.hour * 3600 + now.minute * 60 + now.second
+        if now_seconds % period_seconds == 0:
+            break
+        time.sleep(0.1)
 def get_payout():
+    global instrument, currency_pair
     try:
         d = json.loads(global_value.PayoutData)
+        non_otc_pairs = []
+        
         for pair in d:
-            name = pair[1]
-            payout = pair[5]
-            if (
-                name in WATCHLIST and
-                pair[14] and
-                name.endswith("_otc") and
-                len(name) == 10
-            ):
-                if payout >= min_payout:
-                    global_value.pairs[name] = {'payout': payout, 'type': pair[3]}
-                elif name in global_value.pairs:
-                    del global_value.pairs[name]
+            # Check if pair is available for trading (pair[14] is True) and not OTC
+            if pair[14] is True and not pair[1].endswith('_otc'):
+                pair_info = {
+                    'name': pair[1],
+                    'payout': pair[5],
+                    'type': pair[3]
+                }
+                non_otc_pairs.append(pair_info)
+                # Store in global_value.pairs for reference
+                global_value.pairs[pair[1]] = {'payout': pair[5], 'type': pair[3]}
+        
+        if not non_otc_pairs:
+            global_value.logger(f"{datetime.now()} : [ERROR]: No non-OTC pairs available for trading", "ERROR")
+            return False
+        
+        # Find the pair with highest payout
+        best_pair = max(non_otc_pairs, key=lambda x: x['payout'])
+        
+        # Update global variables
+        currency_pair = best_pair['name']
+        # Convert currency pair name to OANDA instrument format (e.g., EURUSD -> EUR_USD)
+        if len(currency_pair) == 6:
+            instrument = f"{currency_pair[:3]}_{currency_pair[3:]}"
+        else:
+            instrument = currency_pair.replace('', '_')  # Handle other formats if needed
+        
+        global_value.logger(f"{datetime.now()} : [INFO]: Selected pair: {currency_pair} with payout: {best_pair['payout']}%", "INFO")
+        global_value.logger(f"{datetime.now()} : [INFO]: OANDA instrument: {instrument}", "INFO")
+        
         return True
-    except:
+        
+    except Exception as e:
+        global_value.logger(f"{datetime.now()} : [ERROR]: Payout Error: {str(e)}", "ERROR")
         return False
 
-def get_df():
-    try:
-        for i, pair in enumerate(global_value.pairs, 1):
-            df = api.get_candles(pair, period)
-            global_value.logger(f'{pair} ({i}/{len(global_value.pairs)})', "INFO")
-            time.sleep(1)
-        return True
-    except:
-        return False
 
-def make_df(df0, history):
-    df1 = pd.DataFrame(history).sort_values(by='time').reset_index(drop=True)
-    df1['time'] = pd.to_datetime(df1['time'], unit='s', utc=True)
-    df1.set_index('time', inplace=True)
-    df = df1['price'].resample(f'{period}s').ohlc().reset_index()
-    if df0 is not None:
-        ts = datetime.timestamp(df.loc[0]['time'])
-        for x in range(len(df0)):
-            ts2 = datetime.timestamp(df0.loc[x]['time'])
-            if ts2 < ts:
-                df = df._append(df0.loc[x], ignore_index=True)
-            else:
-                break
-        df = df.sort_values(by='time').reset_index(drop=True)
+def get_training_data():
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=30)
+    all_data = []
+
+    while start_time < end_time:
+        params = {
+            "granularity": granularity,
+            "price": "M",
+            "from": start_time.isoformat(),
+            "count": max_candles
+        }
+        r = InstrumentsCandles(instrument=instrument, params=params)
+        client.request(r)
+        candles = r.response["candles"]
+        if not candles:
+            break
+        for c in candles:
+            timestamp = c["time"]
+            o = float(c["mid"]["o"])
+            h = float(c["mid"]["h"])
+            l = float(c["mid"]["l"])
+            c_ = float(c["mid"]["c"])
+            all_data.append((timestamp, o, h, l, c_))
+        last_time = datetime.fromisoformat(candles[-1]["time"].replace("Z", "+00:00"))
+        start_time = last_time + timedelta(minutes=1)
+        time.sleep(0.2)
+
+    df = pd.DataFrame(all_data, columns=["time", "open", "high", "low", "close"])
+    global_value.logger(f"{datetime.now()} : [INFO]: Fetched {len(df)} training data for {instrument}", "INFO")
+    return df
+
+def get_prediction_data():
+    r = InstrumentsCandles(instrument=instrument, params=params)
+    client.request(r)
+    candles = r.response['candles']
+    data = []
+    for c in candles:
+        time_ = c['time']
+        o = float(c['mid']['o'])
+        h = float(c['mid']['h'])
+        l = float(c['mid']['l'])
+        c_ = float(c['mid']['c'])
+        data.append((time_, o, h, l, c_))
+    df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close"])
+    global_value.logger(f"{datetime.now()} : [INFO]: Fetched {len(df)} prediction data for {instrument}", "INFO")
     return df
 
 def prepare_data(df):
     df = df[['time', 'open', 'high', 'low', 'close']]
-    df.rename(columns={'time': 'timestamp'}, inplace=True)
-    df.sort_values(by='timestamp', inplace=True)
+    df.sort_values(by='time', inplace=True)
     df['change_in_price'] = df['close'].diff()
 
     rsi_period = 14
@@ -122,179 +185,121 @@ def prepare_data(df):
 
     df['Price_Rate_Of_Change'] = df['close'].pct_change(periods=roc_period)
     df['Prediction'] = (df['close'].shift(-1) > df['close']).astype(int)
-
     df.dropna(inplace=True)
     return df
 
-def train_and_predict(df):
-    X_train = df[FEATURE_COLS].iloc[:-1]
-    y_train = df['Prediction'].iloc[:-1]
+def train_model(df):
+    df = prepare_data(df)
+    X = df[FEATURE_COLS].iloc[:-2]
+    y = df['Prediction'].iloc[:-2]
+    model = RandomForestClassifier(n_estimators=100, random_state=0)
+    model.fit(X, y)
+    global_value.logger(f"{datetime.now()} : [INFO]: Model trained with {len(X)} data points", "INFO")
+    return model
 
-    model = RandomForestClassifier(n_estimators=100, oob_score=True, criterion="gini", random_state=0)
-    model.fit(X_train, y_train)
-
+def predict_next_move(model, df):
+    df = prepare_data(df)
     X_test = df[FEATURE_COLS].iloc[[-1]]
-    proba = model.predict_proba(X_test)
-    call_conf = proba[0][1]
-    put_conf = 1 - call_conf
-
-    latest_close = df.iloc[-1]['close']
-    latest_ema26 = df['close'].ewm(span=26).mean().iloc[-1]
-
-    if call_conf > PROB_THRESHOLD: 
-        decision = "call"
-        emoji = "🟢"
-        confidence = call_conf
+    proba = model.predict_proba(X_test)[0]
+    call_conf = proba[1]
+    put_conf = proba[0]
+    global_value.logger(f"{datetime.now()} : [DEBUG]: Probabilities - CALL: {call_conf:.2f}, PUT: {put_conf:.2f}", "INFO")
+    if call_conf > PROB_THRESHOLD:
+        return "call"
     elif put_conf > PROB_THRESHOLD:
-        decision = "put"
-        emoji = "🔴"
-        confidence = put_conf
+        return "put"
     else:
-        global_value.logger("⏭️ Skipping trade due to low confidence", "INFO")
+        global_value.logger(f"{datetime.now()} : [INFO]: ⏭️ Skipping trade due to low confidence ({max(call_conf, put_conf):.2f})", "INFO")
         return None
 
-    global_value.logger(f"{emoji} === PREDICTED: {decision.upper()} | CONFIDENCE: {confidence:.2%}", "INFO")
-    return decision
 
 def perform_trade(amount, pair, action, expiration):
     result = api.buy(amount=amount, active=pair, action=action, expirations=expiration)
     trade_id = result[1]
-    time.sleep(expiration)
-    return api.check_win(trade_id)
-
-def martingale_strategy(pair, action):
-    global current_profit
-
-    amount = INITIAL_AMOUNT
-    level = 1
-    result = perform_trade(amount, pair, action, expiration)
-
-    if result is None:
-        return
-
-    if result[1] == 'win':
-        current_profit += amount * (global_value.pairs[pair]['payout'] / 100)
-    else:
-        current_profit -= amount
-
-    while result[1] == 'loose' and level < MARTINGALE_LEVEL:
-        level += 1
-        amount *= 2
-        result = perform_trade(amount, pair, action, expiration)
-
-        if result is None:
-            return
-
-        if result[1] == 'win':
-            current_profit += amount * (global_value.pairs[pair]['payout'] / 100)
-            global_value.logger(f"✅ WIN - Profit: {current_profit:.2f} USD", "INFO")
-            break
-        else:
-            current_profit -= amount
-            global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
-
-    # ✅ Check Take Profit
-    if current_profit >= TAKE_PROFIT:
-        global_value.logger(f"🎯 Take Profit Achieved! Cooling down for 1 hour... Final Profit: {current_profit:.2f} USD", "INFO")
-        time.sleep(3600)  # Sleep for 1 hour
-        current_profit = 0  # Reset profit tracker after cooldown
-
-    if result[1] != 'loose':
-        global_value.logger("WIN - Resetting to base amount.", "INFO")
-    else:
-        global_value.logger("LOSS. Resetting.", "INFO")
-
-def wait_until_next_candle(period_seconds=300, seconds_before=15):
-    while True:
-        now = datetime.now(timezone.utc)
-        next_candle = ((now.timestamp() // period_seconds) + 1) * period_seconds
-        if now.timestamp() >= next_candle - seconds_before:
-            break
-        time.sleep(0.2)
-
-def wait_for_candle_start():
-    while True:
-        now = datetime.now(timezone.utc)
-        if now.second == 0 and now.minute % (period // 60) == 0:
-            break
-        time.sleep(0.1)
-
-# ✅ New timeout check function
-def near_github_timeout():
-    return (time.perf_counter() - start_counter) >= (6 * 3600 - 14 * 60)
-
-# Strategy loop
-def strategie():
-    pairs_snapshot = list(global_value.pairs.keys())
-
-    if len(pairs_snapshot) < MIN_ACTIVE_PAIRS:
-        time.sleep(60)
-        prepare()
-        return
-
-    for i, pair in enumerate(pairs_snapshot, 1):
-        live_pairs = list(global_value.pairs.keys())
-        if len(live_pairs) < MIN_ACTIVE_PAIRS:
-            time.sleep(60)
-            prepare()
-            return
-
-        if pair not in global_value.pairs:
-            continue
-
-        payout = global_value.pairs[pair].get('payout', 0)
-        if payout < min_payout:
-            continue
-
-        wait_until_next_candle(period, 15)
-
-        df = make_df(global_value.pairs[pair].get('dataframe'), global_value.pairs[pair].get('history'))
-        if df is None or df.empty:
-            continue
-
-        global_value.logger(f"{len(df)} Candles collected for === {pair} === ({period // 60} mins timeframe)", "INFO")
-
-        processed_df = prepare_data(df.copy())
-        if processed_df.empty:
-            continue
-
-        decision = train_and_predict(processed_df)
-       
-        
-        if decision:
-            latest_k = processed_df.iloc[-1]['k_percent']
-            if (decision == "call" and latest_k > 90) or (decision == "put" and latest_k < 10):
-                global_value.logger(f"Skipping {decision.upper()} due to %K Stochastic filter: %K = {latest_k:.2f}", "INFO")
-                continue
-
-
-            if near_github_timeout():
-                global_value.logger("🕒 Near GitHub timeout. Skipping new trade to avoid interruption.", "INFO")
-                return
-            wait_for_candle_start()
-            martingale_strategy(pair, decision)
-
-            wait_until_next_candle(period, 60)
-            get_payout()
-            get_df()
+    global_value.logger(f"{datetime.now()} : [INFO]: 🟡 Trade placed: {action.upper()} {pair} | ID {trade_id}", "INFO")
+    return result
 
 def prepare():
     try:
-        return get_payout() and get_df()
-    except:
+        payout_success = get_payout()
+        if payout_success:
+            global_value.logger(f"{datetime.now()} : [INFO]: Trading setup complete for {currency_pair}", "INFO")
+        return payout_success
+    except Exception as e:
+        global_value.logger(f"{datetime.now()} : [ERROR]: Prepare error: {e}", "ERROR")
         return False
+
+def strategie():
+    global model
+    wait_until_next_candle(period_seconds=period, seconds_before=1)
+    df_latest = get_prediction_data()
+    decision = predict_next_move(model, df_latest)
+
+    if decision:
+        global_value.logger(f"{datetime.now()} : [INFO]: 🧠 Final Decision: {decision.upper()}", "INFO")
+        wait_for_candle_start(period_seconds=period)
+        perform_trade(INITIAL_AMOUNT, currency_pair, decision, expiration)
+        
+        # After successful trade, check for better opportunities
+        global_value.logger(f"{datetime.now()} : [INFO]: Checking for better trading opportunities", "INFO")
+        current_pair = currency_pair
+        payout_success = get_payout()
+        
+        # If payout fails, log and continue with current pair
+        if not payout_success:
+            global_value.logger(f"{datetime.now()} : [WARNING]: Failed to get payout data, continuing with current pair: {current_pair}", "WARNING")
+        elif currency_pair != current_pair:
+            global_value.logger(f"{datetime.now()} : [INFO]: Switched from {current_pair} to {currency_pair} for better payout", "INFO")
+            df_train = get_training_data()
+            if not df_train.empty:
+                model = train_model(df_train)
+                global_value.logger(f"{datetime.now()} : [INFO]: Model retrained for new pair: {currency_pair}", "INFO")
+        
+    else:
+        global_value.logger(f"{datetime.now()} : [INFO]: No trade executed this cycle", "INFO")
+        # When skipping trade, reselect best pair and retrain model
+        global_value.logger(f"{datetime.now()} : [INFO]: Reselecting best trading pair due to skipped trade", "INFO")
+        
+        current_pair = currency_pair
+        payout_success = get_payout()
+        
+        if not payout_success:
+            global_value.logger(f"{datetime.now()} : [WARNING]: Failed to get payout data, keeping current pair: {current_pair}", "WARNING")
+        elif currency_pair != current_pair:
+            global_value.logger(f"{datetime.now()} : [INFO]: Switched from {current_pair} to {currency_pair} for better opportunity", "INFO")
+            # Collect training data for the new selected pair
+            df_train = get_training_data()
+            if not df_train.empty:
+                model = train_model(df_train)
+                global_value.logger(f"{datetime.now()} : [INFO]: Model retrained for pair: {currency_pair}", "INFO")
+        
+        wait_for_candle_start(period_seconds=period)
+
 
 def start():
     while not global_value.websocket_is_connected:
         time.sleep(0.1)
     time.sleep(2)
+    
+    # Keep trying to prepare until successful
+    while True:
+        if prepare():
+            # Initial model training
+            df_train = get_training_data()
+            if not df_train.empty:
+                global model
+                model = train_model(df_train)
+            break
+        else:
+            global_value.logger(f"{datetime.now()} : [INFO]: Retrying in 10 minutes...", "INFO")
+            time.sleep(600)  # Wait 10 minutes (600 seconds)
+    
+    # Main trading loop
+    while True:
+        strategie()
 
-    if prepare():
-        while True:
-            strategie()
 
-# Main entry
 if __name__ == "__main__":
     start()
     end_counter = time.perf_counter()
-    global_value.logger(f"CPU-bound Task Time: {int(end_counter - start_counter)} seconds", "INFO")
+    global_value.logger(f"{datetime.now()} : [INFO]: CPU-bound Task Time: {int(end_counter - start_counter)}s", "INFO")
